@@ -16,18 +16,79 @@ CREATE TABLE IF NOT EXISTS events (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_events_person_date ON events(person_id,effective_date);
+CREATE TABLE IF NOT EXISTS absence (
+ id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL REFERENCES personnel(id),
+ category TEXT NOT NULL CHECK(category IN ('annual_leave','other_leave','medical_absence','other')),
+ starts_on TEXT NOT NULL, ends_on TEXT NOT NULL, basis_number TEXT NOT NULL,
+ state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','approved','closed')),
+ CHECK(ends_on>=starts_on)
+);
+CREATE INDEX IF NOT EXISTS ix_absence_person_period ON absence(person_id,starts_on,ends_on);
+CREATE TABLE IF NOT EXISTS duty (
+ id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL REFERENCES personnel(id),
+ duty_date TEXT NOT NULL, label TEXT NOT NULL, basis_number TEXT NOT NULL,
+ state TEXT NOT NULL DEFAULT 'planned' CHECK(state IN ('planned','completed','cancelled'))
+);
+CREATE INDEX IF NOT EXISTS ix_duty_person_date ON duty(person_id,duty_date);
+CREATE TABLE IF NOT EXISTS asset (
+ id INTEGER PRIMARY KEY, name TEXT NOT NULL, inventory_number TEXT UNIQUE NOT NULL,
+ category TEXT NOT NULL, condition TEXT NOT NULL DEFAULT 'serviceable'
+);
+CREATE TABLE IF NOT EXISTS asset_issue (
+ id INTEGER PRIMARY KEY, asset_id INTEGER NOT NULL REFERENCES asset(id),
+ person_id INTEGER NOT NULL REFERENCES personnel(id), issued_on TEXT NOT NULL,
+ returned_on TEXT, basis_number TEXT NOT NULL,
+ CHECK(returned_on IS NULL OR returned_on>=issued_on)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_one_active_issue ON asset_issue(asset_id) WHERE returned_on IS NULL;
+CREATE TABLE IF NOT EXISTS org_unit (
+ id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+ parent_id INTEGER REFERENCES org_unit(id), active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS staff_slot (
+ id INTEGER PRIMARY KEY, unit_id INTEGER NOT NULL REFERENCES org_unit(id),
+ code TEXT NOT NULL UNIQUE, title TEXT NOT NULL, grade TEXT NOT NULL DEFAULT '',
+ authorized INTEGER NOT NULL DEFAULT 1 CHECK(authorized IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS ix_staff_slot_unit ON staff_slot(unit_id);
+CREATE TABLE IF NOT EXISTS hr_document (
+ id INTEGER PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
+ document_number TEXT NOT NULL UNIQUE, document_date TEXT NOT NULL,
+ state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','review','signed','registered','filed')),
+ source_url TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS appointment (
+ id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL REFERENCES personnel(id),
+ slot_id INTEGER NOT NULL REFERENCES staff_slot(id),
+ starts_on TEXT NOT NULL, ends_on TEXT,
+ document_id INTEGER NOT NULL REFERENCES hr_document(id),
+ CHECK(ends_on IS NULL OR ends_on>=starts_on)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_one_slot_holder ON appointment(slot_id) WHERE ends_on IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ix_one_person_slot ON appointment(person_id) WHERE ends_on IS NULL;
 """
 
 
 def init_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as db:
+    with connection(path) as db:
         db.executescript(SCHEMA)
         if not db.execute('SELECT 1 FROM personnel LIMIT 1').fetchone():
             db.executemany(
                 'INSERT INTO personnel(display_name,service_number,status) VALUES (?,?,?)',
                 [('Демо Особа А', 'DEMO-001', 'active'), ('Демо Особа Б', 'DEMO-002', 'leave')],
             )
+        if not db.execute('SELECT 1 FROM asset LIMIT 1').fetchone():
+            db.executemany('INSERT INTO asset(name,inventory_number,category) VALUES(?,?,?)', [
+                ('Демо планшет', 'DEMO-ASSET-001', 'equipment'),
+                ('Демо комплект', 'DEMO-ASSET-002', 'kit'),
+            ])
+        if not db.execute('SELECT 1 FROM org_unit LIMIT 1').fetchone():
+            db.execute('INSERT INTO org_unit(code,name) VALUES(?,?)', ('DEMO-HQ', 'Демо управління'))
+            db.execute('INSERT INTO org_unit(code,name,parent_id) VALUES(?,?,1)',
+                       ('DEMO-HR', 'Демо кадровий підрозділ'))
+            db.execute('INSERT INTO staff_slot(unit_id,code,title,grade) VALUES(?,?,?,?)',
+                       (2, 'DEMO-POS-01', 'Демо посада', ''))
 
 
 @contextmanager
@@ -63,3 +124,134 @@ def add_event(path: Path, person_id: int, kind: str, date: str, basis: str, note
                   'transferred': 'transferred', 'excluded': 'excluded'}.get(kind)
         if status:
             db.execute('UPDATE personnel SET status=? WHERE id=?', (status, person_id))
+
+
+def _date(value: str) -> str:
+    from datetime import date
+    return date.fromisoformat(value).isoformat()
+
+
+def _text(value: str, limit: int = 120) -> str:
+    value = value.strip()
+    if not value or len(value) > limit:
+        raise ValueError('Required field missing or too long')
+    return value
+
+
+def add_person(path: Path, name: str, service_number: str) -> None:
+    if not service_number.startswith('DEMO-'):
+        raise ValueError('Only synthetic DEMO numbers are allowed')
+    with connection(path) as db:
+        db.execute('INSERT INTO personnel(display_name,service_number,status) VALUES(?,?,?)',
+                   (_text(name), _text(service_number, 50), 'active'))
+
+
+def add_absence(path: Path, person_id: int, category: str, start: str, end: str, basis: str) -> None:
+    if category not in {'annual_leave', 'other_leave', 'medical_absence', 'other'}:
+        raise ValueError('Invalid absence category')
+    start, end = _date(start), _date(end)
+    if end < start:
+        raise ValueError('End before start')
+    with connection(path) as db:
+        if not db.execute('SELECT 1 FROM personnel WHERE id=?', (person_id,)).fetchone():
+            raise ValueError('Unknown person')
+        if db.execute('''SELECT 1 FROM absence WHERE person_id=? AND state!='closed'
+                      AND starts_on<=? AND ends_on>=?''', (person_id, end, start)).fetchone():
+            raise ValueError('Overlapping absence')
+        db.execute('INSERT INTO absence(person_id,category,starts_on,ends_on,basis_number) VALUES(?,?,?,?,?)',
+                   (person_id, category, start, end, _text(basis)))
+
+
+def add_duty(path: Path, person_id: int, date: str, label: str, basis: str) -> None:
+    date = _date(date)
+    with connection(path) as db:
+        if not db.execute('SELECT 1 FROM personnel WHERE id=?', (person_id,)).fetchone():
+            raise ValueError('Unknown person')
+        if db.execute('''SELECT 1 FROM absence WHERE person_id=? AND state='approved'
+                      AND starts_on<=? AND ends_on>=?''', (person_id, date, date)).fetchone():
+            raise ValueError('Approved absence conflicts with duty')
+        db.execute('INSERT INTO duty(person_id,duty_date,label,basis_number) VALUES(?,?,?,?)',
+                   (person_id, date, _text(label), _text(basis)))
+
+
+def add_asset(path: Path, name: str, number: str, category: str) -> None:
+    if not number.startswith('DEMO-'):
+        raise ValueError('Only synthetic DEMO numbers are allowed')
+    with connection(path) as db:
+        db.execute('INSERT INTO asset(name,inventory_number,category) VALUES(?,?,?)',
+                   (_text(name), _text(number, 80), _text(category, 50)))
+
+
+def issue_asset(path: Path, asset_id: int, person_id: int, date: str, basis: str) -> None:
+    with connection(path) as db:
+        db.execute('INSERT INTO asset_issue(asset_id,person_id,issued_on,basis_number) VALUES(?,?,?,?)',
+                   (asset_id, person_id, _date(date), _text(basis)))
+
+
+def return_asset(path: Path, issue_id: int, date: str) -> None:
+    with connection(path) as db:
+        row = db.execute('SELECT issued_on,returned_on FROM asset_issue WHERE id=?', (issue_id,)).fetchone()
+        if not row or row['returned_on'] or _date(date) < row['issued_on']:
+            raise ValueError('Invalid asset return')
+        db.execute('UPDATE asset_issue SET returned_on=? WHERE id=?', (_date(date), issue_id))
+
+
+def _demo_code(value: str, limit: int = 80) -> str:
+    value = _text(value, limit)
+    if not value.startswith('DEMO-'):
+        raise ValueError('Only synthetic DEMO identifiers are allowed')
+    return value
+
+
+def add_unit(path: Path, code: str, name: str, parent_id: int | None) -> None:
+    with connection(path) as db:
+        if parent_id is not None and not db.execute(
+            'SELECT 1 FROM org_unit WHERE id=? AND active=1', (parent_id,)
+        ).fetchone():
+            raise ValueError('Unknown parent unit')
+        db.execute('INSERT INTO org_unit(code,name,parent_id) VALUES(?,?,?)',
+                   (_demo_code(code), _text(name), parent_id))
+
+
+def add_slot(path: Path, unit_id: int, code: str, title: str, grade: str) -> None:
+    with connection(path) as db:
+        if not db.execute('SELECT 1 FROM org_unit WHERE id=? AND active=1', (unit_id,)).fetchone():
+            raise ValueError('Unknown unit')
+        db.execute('INSERT INTO staff_slot(unit_id,code,title,grade) VALUES(?,?,?,?)',
+                   (unit_id, _demo_code(code), _text(title), grade.strip()[:60]))
+
+
+def add_document(path: Path, kind: str, title: str, number: str, date: str) -> None:
+    if kind not in {'order', 'report', 'referral', 'other'}:
+        raise ValueError('Unsupported document kind')
+    with connection(path) as db:
+        db.execute('INSERT INTO hr_document(kind,title,document_number,document_date) VALUES(?,?,?,?)',
+                   (kind, _text(title), _demo_code(number), _date(date)))
+
+
+def advance_document(path: Path, document_id: int) -> None:
+    transitions = {'draft': 'review', 'review': 'signed', 'signed': 'registered',
+                   'registered': 'filed'}
+    with connection(path) as db:
+        row = db.execute('SELECT state FROM hr_document WHERE id=?', (document_id,)).fetchone()
+        if not row or row['state'] not in transitions:
+            raise ValueError('No next state')
+        db.execute('UPDATE hr_document SET state=? WHERE id=?',
+                   (transitions[row['state']], document_id))
+
+
+def appoint(path: Path, person_id: int, slot_id: int, document_id: int, start: str) -> None:
+    start = _date(start)
+    with connection(path) as db:
+        doc = db.execute('SELECT state,kind,document_date FROM hr_document WHERE id=?',
+                         (document_id,)).fetchone()
+        if not doc or doc['kind'] != 'order' or doc['state'] not in {'registered','filed'}:
+            raise ValueError('A registered order is required')
+        if doc['document_date'] > start:
+            raise ValueError('Order date is later than appointment')
+        if not db.execute('SELECT 1 FROM personnel WHERE id=?', (person_id,)).fetchone():
+            raise ValueError('Unknown person')
+        if not db.execute('SELECT 1 FROM staff_slot WHERE id=? AND authorized=1', (slot_id,)).fetchone():
+            raise ValueError('Unknown or inactive slot')
+        db.execute('INSERT INTO appointment(person_id,slot_id,document_id,starts_on) VALUES(?,?,?,?)',
+                   (person_id, slot_id, document_id, start))
