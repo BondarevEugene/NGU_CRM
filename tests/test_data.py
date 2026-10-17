@@ -5,6 +5,7 @@ from pathlib import Path
 from ngu_crm.data import (add_absence, add_duty, add_event, connection, init_db,
                           issue_asset, return_asset, add_document, advance_document,
                           appoint, add_unit, add_slot)
+from ngu_crm.reports import staffing_summary, administrative_snapshot
 
 
 class DemoStorageTests(unittest.TestCase):
@@ -67,6 +68,21 @@ class DemoStorageTests(unittest.TestCase):
             add_slot(db, 3, 'DEMO-P3', 'Демо посада 3', 'Демо')
             with connection(db) as session:
                 self.assertEqual(session.execute('SELECT count(*) FROM staff_slot').fetchone()[0], 2)
+
+    def test_management_snapshot_counts_approved_absence_by_date(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Path(folder) / 'demo.db'
+            init_db(db)
+            add_absence(db, 1, 'annual_leave', '2026-10-17', '2026-10-18', 'DEMO-ORD-1')
+            before, totals = administrative_snapshot(db, '2026-10-17')
+            self.assertEqual(totals['approved_absence'], 0)
+            with connection(db) as session:
+                session.execute("UPDATE absence SET state='approved' WHERE id=1")
+            during, totals = administrative_snapshot(db, '2026-10-17')
+            after, later = administrative_snapshot(db, '2026-10-19')
+            self.assertEqual(totals['approved_absence'], 1)
+            self.assertEqual(later['approved_absence'], 0)
+            self.assertEqual(staffing_summary(db)[1]['vacant'], 1)
 
 
 if __name__ == '__main__':

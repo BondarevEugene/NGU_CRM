@@ -4,6 +4,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS app_role (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS app_user (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+ password_hash TEXT NOT NULL, role_id INTEGER REFERENCES app_role(id), is_owner INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS role_permission (role_id INTEGER NOT NULL REFERENCES app_role(id),
+ section TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY(role_id,section,action));
+CREATE TABLE IF NOT EXISTS audit_event (id INTEGER PRIMARY KEY, actor_id INTEGER NOT NULL,
+ action TEXT NOT NULL, route TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS personnel (
  id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, service_number TEXT UNIQUE NOT NULL,
  status TEXT NOT NULL CHECK(status IN ('active','leave','transferred','excluded')),
@@ -57,6 +64,20 @@ CREATE TABLE IF NOT EXISTS hr_document (
  state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','review','signed','registered','filed')),
  source_url TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS batch_duty (
+ id INTEGER PRIMARY KEY, document_id INTEGER NOT NULL UNIQUE REFERENCES hr_document(id),
+ label TEXT NOT NULL, starts_on TEXT NOT NULL, ends_on TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK(ends_on>=starts_on)
+);
+CREATE TABLE IF NOT EXISTS batch_duty_member (
+ batch_id INTEGER NOT NULL REFERENCES batch_duty(id),
+ person_id INTEGER NOT NULL REFERENCES personnel(id),
+ PRIMARY KEY(batch_id,person_id)
+);
+CREATE TABLE IF NOT EXISTS data_access_catalog (
+ code TEXT PRIMARY KEY, dataset_name TEXT NOT NULL, category TEXT NOT NULL,
+ owner_section TEXT NOT NULL, handling_note TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS appointment (
  id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL REFERENCES personnel(id),
  slot_id INTEGER NOT NULL REFERENCES staff_slot(id),
@@ -73,6 +94,20 @@ def init_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with connection(path) as db:
         db.executescript(SCHEMA)
+        existing = {row['name'] for row in db.execute('PRAGMA table_info(personnel)')}
+        for column in ('rank_label','specialty','service_since','profile_note'):
+            if column not in existing:
+                db.execute(f"ALTER TABLE personnel ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        db.executemany("""INSERT OR IGNORE INTO data_access_catalog
+            (code,dataset_name,category,owner_section,handling_note)
+            VALUES (?,?,?,?,?)""", [
+            ('personnel','Картки персоналу','personal','personnel','Лише синтетичні дані; доступ за роллю'),
+            ('events','Кадрові події','personal','personnel','Історія підстав зберігається'),
+            ('duties','Адміністративна зайнятість','internal','duties','Без маршрутів, позицій і бойових завдань'),
+            ('documents','Документи-основи','internal','documents','Номери лише DEMO; не офіційний архів'),
+            ('assets','Номерне майно','internal','assets','Лише демонстраційне неозброєне майно'),
+            ('roles','Ролі та аудит','restricted_metadata','roles','Тільки власник для зміни правил'),
+        ])
         if not db.execute('SELECT 1 FROM personnel LIMIT 1').fetchone():
             db.executemany(
                 'INSERT INTO personnel(display_name,service_number,status) VALUES (?,?,?)',
@@ -170,6 +205,10 @@ def add_duty(path: Path, person_id: int, date: str, label: str, basis: str) -> N
         if db.execute('''SELECT 1 FROM absence WHERE person_id=? AND state='approved'
                       AND starts_on<=? AND ends_on>=?''', (person_id, date, date)).fetchone():
             raise ValueError('Approved absence conflicts with duty')
+        if db.execute("""SELECT 1 FROM batch_duty_member m JOIN batch_duty b ON b.id=m.batch_id
+            WHERE m.person_id=? AND b.starts_on<=? AND b.ends_on>=?""",
+            (person_id,date,date)).fetchone():
+            raise ValueError('Batch period conflicts with duty')
         db.execute('INSERT INTO duty(person_id,duty_date,label,basis_number) VALUES(?,?,?,?)',
                    (person_id, date, _text(label), _text(basis)))
 
@@ -255,3 +294,54 @@ def appoint(path: Path, person_id: int, slot_id: int, document_id: int, start: s
             raise ValueError('Unknown or inactive slot')
         db.execute('INSERT INTO appointment(person_id,slot_id,document_id,starts_on) VALUES(?,?,?,?)',
                    (person_id, slot_id, document_id, start))
+
+
+def update_profile(path: Path, person_id: int, rank_label: str, specialty: str,
+                   service_since: str, profile_note: str) -> None:
+    if service_since:
+        service_since = _date(service_since)
+    if len(profile_note) > 500:
+        raise ValueError('Note too long')
+    with connection(path) as db:
+        result = db.execute("""UPDATE personnel SET rank_label=?,specialty=?,service_since=?,profile_note=?
+             WHERE id=?""", (rank_label.strip()[:80], specialty.strip()[:80], service_since,
+                            profile_note.strip(), person_id))
+        if result.rowcount != 1:
+            raise ValueError('Unknown person')
+
+
+def create_batch_duty(path: Path, document_id: int, label: str, start: str,
+                      end: str, person_ids: list[int]) -> int:
+    """One registered demo document, one atomic personnel selection, no operational locations."""
+    label, start, end = _text(label, 120), _date(start), _date(end)
+    ids = list(person_ids)
+    if end < start or not ids or len(ids) > 100 or len(set(ids)) != len(ids):
+        raise ValueError('Choose 1–100 distinct people and a valid period')
+    with connection(path) as db:
+        doc = db.execute('SELECT kind,state,document_number FROM hr_document WHERE id=?',
+                         (document_id,)).fetchone()
+        if not doc or doc['kind'] != 'order' or doc['state'] not in ('registered','filed'):
+            raise ValueError('A registered demo order is required')
+        if db.execute('SELECT 1 FROM batch_duty WHERE document_id=?', (document_id,)).fetchone():
+            raise ValueError('Document is already used for a batch')
+        for person_id in ids:
+            person = db.execute('SELECT status FROM personnel WHERE id=?', (person_id,)).fetchone()
+            if not person or person['status'] != 'active':
+                raise ValueError('Selection contains a person without active status')
+            if db.execute("""SELECT 1 FROM absence WHERE person_id=? AND state='approved'
+                AND starts_on<=? AND ends_on>=?""", (person_id, end, start)).fetchone():
+                raise ValueError('Selection conflicts with approved absence')
+            if db.execute("""SELECT 1 FROM duty WHERE person_id=? AND state='planned'
+                AND duty_date BETWEEN ? AND ?""", (person_id, start, end)).fetchone():
+                raise ValueError('Selection conflicts with planned duty')
+            if db.execute("""SELECT 1 FROM batch_duty_member m JOIN batch_duty b ON b.id=m.batch_id
+                WHERE m.person_id=? AND b.starts_on<=? AND b.ends_on>=?""",
+                (person_id,end,start)).fetchone():
+                raise ValueError('Selection conflicts with an existing batch period')
+        batch_id = db.execute("""INSERT INTO batch_duty(document_id,label,starts_on,ends_on)
+            VALUES(?,?,?,?)""", (document_id,label,start,end)).lastrowid
+        db.executemany('INSERT INTO batch_duty_member(batch_id,person_id) VALUES(?,?)',
+                       [(batch_id,pid) for pid in ids])
+        db.executemany('''INSERT INTO duty(person_id,duty_date,label,basis_number)
+            VALUES(?,?,?,?)''', [(pid,start,label,doc['document_number']) for pid in ids])
+        return batch_id
